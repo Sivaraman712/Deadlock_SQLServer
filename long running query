@@ -1,0 +1,148 @@
+CREATE or alter proc [dbo].[DBA_GeoPITS_Longrunning]
+(
+    @Subject NVARCHAR(256),
+    @profile_name NVARCHAR(128),
+    @recipients NVARCHAR(MAX),
+    @copy_recipients NVARCHAR(MAX) ,
+    @ServerName NVARCHAR(128) 
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Step 1: Insert long-running queries into the table
+    INSERT INTO dbadb..longqrydetails (InstanceName, SPID, StartTime, ElapsedTime, UserName, ProgramName, DatabaseName, ExecutingSQL, StatementText, WaitType, StoredProcedure)
+    SELECT 
+        @ServerName AS InstanceName,
+        r.session_id AS SPID,
+        r.start_time AS StartTime,
+        CONVERT(VARCHAR, DATEADD(ms, r.total_elapsed_time, 0), 8) AS ElapsedTime,
+        c.login_name AS UserName,
+        c.program_name AS ProgramName,
+        DB_NAME(r.database_id) AS DatabaseName,
+        t.[text] AS ExecutingSQL,
+        SUBSTRING(
+            t.TEXT, 
+            r.statement_start_offset / 2 + 1, 
+            (CASE 
+                WHEN r.statement_end_offset = -1 
+                    THEN LEN(CONVERT(NVARCHAR(max), t.TEXT)) * 2 
+                ELSE r.statement_end_offset 
+             END - r.statement_start_offset) / 2 + 1
+        ) AS statement_text,
+        r.wait_type AS WaitType,
+        COALESCE(QUOTENAME(DB_NAME(t.dbid)) + N'.' + QUOTENAME(OBJECT_SCHEMA_NAME(t.objectid, t.dbid)) + N'.' + 
+         QUOTENAME(OBJECT_NAME(t.objectid, t.dbid)), 'Query') AS StoredProcedure
+    FROM 
+        sys.dm_exec_requests r
+        INNER JOIN sys.dm_exec_sessions c ON r.session_id = c.session_id
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+    WHERE (r.wait_type NOT LIKE 'SP_SERVER_DIAGNOSTICS%' or r.wait_type is null)
+        AND r.session_id != @@SPID
+        AND r.session_id > 50
+        AND t.[text] <> 'null'
+        AND DB_NAME(r.database_id) NOT IN ('distribution','msdb','model','master')
+        AND t.[text] <> 'begin tran'
+       -- AND t.[text] NOT LIKE '%ALTER INDEX%'
+        AND t.[text] NOT LIKE 'UPDATE STATISTICS%'
+        AND t.[text] NOT LIKE '%CREATE PROCEDURE sp_readrequest%'
+        AND t.[text] NOT LIKE 'BACKUP%'
+        AND t.[text] NOT LIKE 'SP_SERVER_DIAGNOSTICS%'
+-- AND r.total_elapsed_time / 1000 >= 300  -- Change the Filter queries longer than 5 minutes (300 seconds)
+        AND c.status <> 'sleeping'
+    ORDER BY ElapsedTime DESC;
+    -- Step 2: Generate the SPID list for termination
+    DECLARE @SPIDList NVARCHAR(MAX);
+    -- Concatenate SPIDs into a comma-separated list
+    SET @SPIDList = 
+        STUFF(
+            (SELECT top 5 ', ' + CAST(SPID AS NVARCHAR)
+             FROM dbadb..longqrydetails 
+             WHERE DATEDIFF(MINUTE, logdate, GETDATE()) < 1
+			ORDER BY ElapsedTime DESC
+               FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)')
+        , 1, 2, ''); -- Remove the leading comma and space
+    -- Step 3: Generate HTML content from the longqrydetails table
+    DECLARE @HTML NVARCHAR(MAX);
+    SET @HTML = 
+        '<html>' +
+        '<head>' +
+        '<style>' +
+        'body { font-family: Arial, sans-serif; color: #333; line-height: 1.6; }' +
+        'table { width: 100%; border-collapse: collapse; margin-top: 20px; }' +
+        'table, th, td { border: 1px solid #ddd; }' +
+        'th, td { padding: 12px; text-align: left; }' +
+        'th { background-color: #008bff; color: white; }' +
+        'tr:nth-child(even) { background-color: #f2f2f2; }' +
+        'p { margin: 0 0 10px; }' +
+        'h2 { color: #007bff; border-bottom: 2px solid #007bff; padding-bottom: 10px; }' +
+        'h3 { color: #0056b3; margin-top: 20px; }' +
+        '.query-text { background-color: #f5f5f5; border: 1px solid #ccc; padding: 8px; font-family: ''Courier New'', Courier, monospace; font-size: 10px; line-height: 1.3; overflow-x: auto; overflow-y: auto; max-height: 100px; max-width: 600px; white-space: pre-wrap; word-wrap: break-word; display: block; border-radius: 3px; }' +
+        '.spid-highlight { background-color: #fff3cd; padding: 10px; border-left: 4px solid #ff9800; margin: 15px 0; font-weight: bold; }' +
+        '.warning { color: #d9534f; font-weight: bold; }' +
+        '.footer { margin-top: 30px; border-top: 1px solid #ddd; padding-top: 15px; font-size: 12px; color: #666; }' +
+        '</style>' +
+        '</head>' +
+        '<body>' +
+        '<h2>Long-Running Query Alert</h2>' +
+        '<p>Hello Team,</p>' +
+        '<p>Our DBAs have detected <span class="warning">long-running queries</span> on <b>' + @ServerName + '</b> Server that are consuming significant resources and may impact overall performance.</p>' +
+        '<div class="spid-highlight">SPID(s): <strong>' + ISNULL(@SPIDList, 'No SPIDs available') + '</strong></div>' +
+        '<h3>Query Details:</h3>' +
+        '<table>' +
+        '<thead>' +
+        '<tr>' +
+        '<th>SPID</th>' +
+        '<th>Start Time</th>' +
+        '<th>Elapsed Time</th>' +
+        '<th>User</th>' +
+        '<th>Database</th>' +
+        '<th>Wait Type</th>' +
+        '<th>Stored Procedure</th>' +
+        '<th>SQL Query (Scroll to view)</th>' +
+        '</tr>' +
+        '</thead>' +
+        '<tbody>' +
+        (SELECT TOP 5
+            '<tr>' +
+            '<td><b>' + ISNULL(CAST(SPID AS NVARCHAR(MAX)), '') + '</b></td>' +
+            '<td>' + ISNULL(CONVERT(varchar, StartTime, 120), '') + '</td>' +
+            '<td><b>' + ISNULL(ElapsedTime, '') + '</b></td>' +
+            '<td>' + ISNULL(UserName, '') + '</td>' +
+            '<td>' + ISNULL(DatabaseName, '') + '</td>' +
+            '<td>' + ISNULL(WaitType, '') + '</td>' +
+            '<td>' + ISNULL(StoredProcedure, 'Query') + '</td>' +
+            '<td><div class="query-text">' + ISNULL(REPLACE(REPLACE(REPLACE(StatementText, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), 'N/A') + '</div></td>' +
+            '</tr>'
+        FROM dbadb..longqrydetails 
+        WHERE DATEDIFF(MINUTE, logdate, GETDATE()) < 1
+        ORDER BY ElapsedTime DESC
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)') +
+        '</tbody>' +
+        '</table>' +
+      
+        'This query has been running for over 5 minutes. We recommend terminating it to avoid potential performance issues.<br>' +
+        'Please confirm if you would like us to proceed with terminating the query, or if you prefer to allow it to complete its execution.</p>' +
+        '<p>Kindly provide your confirmation, and our team will take the necessary action based on your response.</p>' +
+     
+        '<p>Thanks for your attention.</p>' +
+        '<p><b>Best Regards,</b><br>MSSQL DBA<br>GeoPITS</p>' +
+       
+        '</div>' +
+        '</body>' +
+        '</html>';
+    -- Output the final HTML
+    --SELECT @HTML AS HTML;
+    IF (@HTML IS NOT NULL)
+    BEGIN
+        EXEC msdb.dbo.Sp_send_dbmail
+            @profile_name = @profile_name,
+            @body = @HTML,
+            @body_format = 'html',
+            @recipients = @recipients,
+            @copy_recipients = @copy_recipients,
+            @subject = @Subject;
+    END
+    SET NOCOUNT OFF;
+END
+SET ANSI_NULLS OFF
+GO
