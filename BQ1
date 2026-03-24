@@ -1,0 +1,107 @@
+SELECT
+    @@SERVERNAME                                AS [Server Name],
+    b.session_id                                AS [Blocked Session ID],
+    t.[text]                                    AS [Query Waiting to Execute],
+    r.start_time,
+    (b.wait_duration_ms / 1000) / 60            AS [Waiting in Minutes],
+    b.wait_type                                 AS [Wait Type],
+    b.blocking_session_id                       AS [Blocking Session ID],
+    s_blocker.status                            AS [Blocker Status],
+    s_blocker.program_name                      AS [Blocker Program],
+
+    -- ✅ Safely get blocking query text (active or sleeping)
+    COALESCE(t1.[text], t2.[text])              AS [Blocking Query],
+
+    -- ✅ SQL Agent Job Name (only when blocker is an Agent job)
+    CASE
+        WHEN s_blocker.program_name LIKE 'SQLAgent - TSQL JobStep (Job 0x%'
+        THEN (
+            SELECT sj.name
+            FROM msdb.dbo.sysjobs sj
+            WHERE sj.job_id = TRY_CONVERT(          -- ✅ TRY_CONVERT won't crash on bad input
+                uniqueidentifier,
+                CONVERT(
+                    varbinary(16),
+                    SUBSTRING(
+                        s_blocker.program_name,
+                        CHARINDEX('0x', s_blocker.program_name),
+                        34
+                    ),
+                    1
+                )
+            )
+        )
+        ELSE NULL
+    END                                         AS [SQL Agent Job Name],
+
+    -- ✅ Job Owner (only for Agent job sessions)
+    CASE
+        WHEN s_blocker.program_name LIKE 'SQLAgent - TSQL JobStep (Job 0x%'
+        THEN (
+            SELECT SUSER_SNAME(sj.owner_sid)
+            FROM msdb.dbo.sysjobs sj
+            WHERE sj.job_id = TRY_CONVERT(
+                uniqueidentifier,
+                CONVERT(
+                    varbinary(16),
+                    SUBSTRING(
+                        s_blocker.program_name,
+                        CHARINDEX('0x', s_blocker.program_name),
+                        34
+                    ),
+                    1
+                )
+            )
+        )
+        ELSE NULL
+    END                                         AS [Job Owner],
+
+    s.program_name                              AS [Blocked Program],
+    s.client_interface_name
+
+FROM
+    sys.dm_os_waiting_tasks                     b
+
+INNER JOIN
+    sys.dm_exec_requests                        r
+        ON  r.session_id = b.session_id
+        AND r.session_id > 50
+
+-- Blocked session info
+INNER JOIN
+    sys.dm_exec_sessions                        s
+        ON  s.session_id = b.session_id
+
+-- ✅ LEFT JOIN — blocker may have no active request (sleeping)
+LEFT JOIN
+    sys.dm_exec_requests                        r1
+        ON  r1.session_id = b.blocking_session_id
+
+-- ✅ LEFT JOIN — blocker session details
+LEFT JOIN
+    sys.dm_exec_sessions                        s_blocker
+        ON  s_blocker.session_id = b.blocking_session_id
+
+-- ✅ LEFT JOIN — needed for sleeping blocker last SQL handle
+LEFT JOIN
+    sys.dm_exec_connections                     c1
+        ON  c1.session_id = b.blocking_session_id
+
+-- Blocked session query
+OUTER APPLY
+    sys.dm_exec_sql_text(r.sql_handle)          t
+
+-- Active blocker query (running sessions)
+OUTER APPLY
+    sys.dm_exec_sql_text(r1.sql_handle)         t1
+
+-- ✅ Sleeping blocker query (last executed SQL via connection handle)
+OUTER APPLY
+    sys.dm_exec_sql_text(c1.most_recent_sql_handle) t2
+
+WHERE
+    b.blocking_session_id <> 0
+    AND b.blocking_session_id <> b.session_id
+
+ORDER BY
+    (b.wait_duration_ms / 1000) / 60 DESC;
