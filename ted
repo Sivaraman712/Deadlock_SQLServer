@@ -1,0 +1,10 @@
+
+IF EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysjobhistory
+    WHERE job_id = (SELECT job_id FROM msdb.dbo.sysjobs WHERE name = @JobName)
+      AND run_status = 4   -- 4 = Running
+)
+    PRINT 'Job is running';
+ELSE
+    PRINT 'Job not running';
