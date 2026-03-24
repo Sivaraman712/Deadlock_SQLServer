@@ -6,14 +6,32 @@ SELECT
     (b.wait_duration_ms / 1000) / 60       AS [Waiting in Minutes],
     b.wait_type                             AS [Wait Type],
     b.blocking_session_id                   AS [Blocking Session ID],
-
     s_blocker.status                        AS [Blocker Status],
-
-   
     COALESCE(t1.[text], t2.[text])          AS [Blocking Query],
-
     s.program_name,
-    s.client_interface_name
+    s.client_interface_name,
+
+    CASE
+        WHEN s.program_name LIKE 'SQLAgent - TSQL JobStep%'
+        THEN (
+            SELECT sj.name
+            FROM msdb.dbo.sysjobs sj
+            WHERE sj.job_id = CONVERT(
+                uniqueidentifier,
+                CONVERT(
+                    varbinary(16),
+                    SUBSTRING(
+                        s.program_name,
+                        CHARINDEX('0x', s.program_name),   -- find where hex starts
+                        34                                  -- '0x' + 32 hex chars = 34
+                    ),
+                    1  -- style 1 = hex string to binary
+                )
+            )
+        )
+        ELSE NULL
+    END                                     AS [SQL Agent Job Name]
+
 FROM
     sys.dm_os_waiting_tasks             b
 
@@ -39,10 +57,10 @@ LEFT JOIN
         ON  c1.session_id = b.blocking_session_id
 
 OUTER APPLY
-    sys.dm_exec_sql_text(r.sql_handle)          t   -- blocked session's query
+    sys.dm_exec_sql_text(r.sql_handle)              t
 
 OUTER APPLY
-    sys.dm_exec_sql_text(r1.sql_handle)         t1
+    sys.dm_exec_sql_text(r1.sql_handle)             t1
 
 OUTER APPLY
     sys.dm_exec_sql_text(c1.most_recent_sql_handle) t2
