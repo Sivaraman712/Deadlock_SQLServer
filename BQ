@@ -1,0 +1,183 @@
+-- ============================================================
+-- STEP 1: Capture blocking SQL Agent jobs owned by dba_agent
+-- ============================================================
+IF OBJECT_ID('tempdb..#BlockingJobs') IS NOT NULL
+    DROP TABLE #BlockingJobs;
+
+SELECT
+    b.session_id                            AS [Blocked Session ID],
+    b.blocking_session_id                   AS [Blocking Session ID],
+    s_blocker.program_name                  AS [Blocker Program Name],
+    (b.wait_duration_ms / 1000) / 60        AS [Waiting in Minutes],
+    b.wait_type                             AS [Wait Type],
+    COALESCE(t1.[text], t2.[text])          AS [Blocking Query],
+
+    -- Extract Job ID from program_name
+    CONVERT(
+        uniqueidentifier,
+        CONVERT(
+            varbinary(16),
+            SUBSTRING(
+                s_blocker.program_name,
+                CHARINDEX('0x', s_blocker.program_name),
+                34
+            ),
+            1
+        )
+    )                                       AS [Job ID],
+
+    sj.name                                 AS [Job Name],
+    sj.owner_sid                            AS [Owner SID],
+    SUSER_SNAME(sj.owner_sid)               AS [Job Owner]
+
+INTO #BlockingJobs
+
+FROM
+    sys.dm_os_waiting_tasks                 b
+
+INNER JOIN
+    sys.dm_exec_requests                    r
+        ON  r.session_id = b.session_id
+        AND r.session_id > 50
+
+INNER JOIN
+    sys.dm_exec_sessions                    s
+        ON  s.session_id = b.session_id
+
+LEFT JOIN
+    sys.dm_exec_requests                    r1
+        ON  r1.session_id = b.blocking_session_id
+
+LEFT JOIN
+    sys.dm_exec_sessions                    s_blocker
+        ON  s_blocker.session_id = b.blocking_session_id
+
+LEFT JOIN
+    sys.dm_exec_connections                 c1
+        ON  c1.session_id = b.blocking_session_id
+
+-- Only consider SQL Agent job sessions as the BLOCKER
+INNER JOIN
+    msdb.dbo.sysjobs                        sj
+        ON  sj.job_id = CONVERT(
+                uniqueidentifier,
+                CONVERT(
+                    varbinary(16),
+                    SUBSTRING(
+                        s_blocker.program_name,
+                        CHARINDEX('0x', s_blocker.program_name),
+                        34
+                    ),
+                    1
+                )
+            )
+
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle)              t
+OUTER APPLY sys.dm_exec_sql_text(r1.sql_handle)             t1
+OUTER APPLY sys.dm_exec_sql_text(c1.most_recent_sql_handle) t2
+
+WHERE
+    b.blocking_session_id <> 0
+    AND b.blocking_session_id <> b.session_id
+    AND s_blocker.program_name LIKE 'SQLAgent - TSQL JobStep%';   -- blocker must be an Agent job
+
+
+-- ============================================================
+-- STEP 2: Preview what will be stopped (for audit/logging)
+-- ============================================================
+SELECT
+    [Blocked Session ID],
+    [Blocking Session ID],
+    [Job Name],
+    [Job Owner],
+    [Waiting in Minutes],
+    [Wait Type],
+    [Blocking Query]
+FROM #BlockingJobs
+WHERE [Job Owner] = 'dba_agent';
+
+
+-- ============================================================
+-- STEP 3: Stop each blocking job owned by dba_agent
+-- ============================================================
+DECLARE
+    @JobName        NVARCHAR(256),
+    @JobOwner       NVARCHAR(256),
+    @WaitMinutes    INT,
+    @LogMsg         NVARCHAR(1000);
+
+DECLARE job_cursor CURSOR FAST_FORWARD FOR
+    SELECT DISTINCT
+        [Job Name],
+        [Job Owner],
+        [Waiting in Minutes]
+    FROM #BlockingJobs
+    WHERE [Job Owner] = 'dba_agent';           -- ✅ Only stop jobs owned by dba_agent
+
+OPEN job_cursor;
+FETCH NEXT FROM job_cursor INTO @JobName, @JobOwner, @WaitMinutes;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+
+    -- Safety check: confirm job is still actively running before stopping
+    IF EXISTS (
+        SELECT 1
+        FROM msdb.dbo.sysjobactivity ja
+        INNER JOIN msdb.dbo.sysjobs   sj ON sj.job_id = ja.job_id
+        WHERE sj.name           = @JobName
+          AND ja.start_execution_date IS NOT NULL
+          AND ja.stop_execution_date  IS NULL         -- still running
+          AND ja.session_id = (
+                SELECT MAX(session_id)
+                FROM msdb.dbo.syssessions
+              )
+    )
+    BEGIN
+        SET @LogMsg = FORMATMESSAGE(
+            '[%s] Stopping job [%s] owned by [%s] — was blocking for %d minute(s).',
+            CONVERT(VARCHAR, GETDATE(), 120),
+            @JobName,
+            @JobOwner,
+            @WaitMinutes
+        );
+
+        PRINT @LogMsg;
+
+        -- ✅ Stop the job
+        EXEC msdb.dbo.sp_stop_job @job_name = @JobName;
+    END
+    ELSE
+    BEGIN
+        PRINT 'Job [' + @JobName + '] is no longer running — skip.';
+    END
+
+    FETCH NEXT FROM job_cursor INTO @JobName, @JobOwner, @WaitMinutes;
+END
+
+CLOSE job_cursor;
+DEALLOCATE job_cursor;
+
+DROP TABLE #BlockingJobs;
+```
+
+---
+
+## Logic Flow
+```
+dm_os_waiting_tasks
+       │
+       ▼
+Is blocking_session a SQLAgent job?  ──No──▶ Ignore
+       │ Yes
+       ▼
+Resolve Job ID → msdb.sysjobs
+       │
+       ▼
+Is job owner = 'dba_agent'?  ──No──▶ Ignore
+       │ Yes
+       ▼
+Is job still actively running?  ──No──▶ Skip (already finished)
+       │ Yes
+       ▼
+   sp_stop_job  ✅
