@@ -1,73 +1,308 @@
-SELECT
-    @@SERVERNAME                            AS [Server Name],
-    b.session_id                            AS [Blocked Session ID],
-    t.[text]                                AS [Query Waiting to Execute],
-    r.start_time,
-    (b.wait_duration_ms / 1000) / 60       AS [Waiting in Minutes],
-    b.wait_type                             AS [Wait Type],
-    b.blocking_session_id                   AS [Blocking Session ID],
-    s_blocker.status                        AS [Blocker Status],
-    COALESCE(t1.[text], t2.[text])          AS [Blocking Query],
-    s.program_name,
-    s.client_interface_name,
+-- ============================================================
+-- STEP 0: Create the log table in dbadb (run once)
+-- ============================================================
+USE dbadb;
+GO
 
-    CASE
-        WHEN s.program_name LIKE 'SQLAgent - TSQL JobStep%'
-        THEN (
-            SELECT sj.name
-            FROM msdb.dbo.sysjobs sj
-            WHERE sj.job_id = CONVERT(
-                uniqueidentifier,
-                CONVERT(
-                    varbinary(16),
-                    SUBSTRING(
-                        s.program_name,
-                        CHARINDEX('0x', s.program_name),   -- find where hex starts
-                        34                                  -- '0x' + 32 hex chars = 34
-                    ),
-                    1  -- style 1 = hex string to binary
-                )
-            )
+IF NOT EXISTS (
+    SELECT 1 FROM sys.tables 
+    WHERE name = 'BlockingJobLog' 
+    AND SCHEMA_NAME(schema_id) = 'dbo'
+)
+BEGIN
+    CREATE TABLE dbo.BlockingJobLog (
+        LogID                   INT             IDENTITY(1,1)   PRIMARY KEY,
+        LogDate                 DATETIME        NOT NULL        DEFAULT GETDATE(),
+        ServerName              NVARCHAR(256)   NOT NULL,
+        BlockedSessionID        INT             NULL,
+        BlockingSessionID       INT             NULL,
+        JobName                 NVARCHAR(256)   NULL,
+        JobOwner                NVARCHAR(256)   NULL,
+        JobID                   UNIQUEIDENTIFIER NULL,
+        WaitingMinutes          INT             NULL,
+        WaitType                NVARCHAR(256)   NULL,
+        BlockingQuery           NVARCHAR(MAX)   NULL,
+        BlockedQuery            NVARCHAR(MAX)   NULL,
+        ActionTaken             NVARCHAR(100)   NULL,   -- 'JOB STOPPED' / 'JOB NOT RUNNING' / 'DETECTED ONLY'
+        Remarks                 NVARCHAR(1000)  NULL
+    );
+
+    PRINT 'Table dbadb.dbo.BlockingJobLog created successfully.';
+END
+ELSE
+    PRINT 'Table dbadb.dbo.BlockingJobLog already exists — skipped creation.';
+GO
+
+
+-- ============================================================
+-- STEP 1: Capture blocking SQL Agent jobs owned by dba_agent
+-- ============================================================
+USE master;
+GO
+
+IF OBJECT_ID('tempdb..#BlockingJobs') IS NOT NULL
+    DROP TABLE #BlockingJobs;
+
+SELECT
+    b.session_id                            AS [Blocked Session ID],
+    b.blocking_session_id                   AS [Blocking Session ID],
+    s_blocker.program_name                  AS [Blocker Program Name],
+    (b.wait_duration_ms / 1000) / 60        AS [Waiting in Minutes],
+    b.wait_type                             AS [Wait Type],
+    t.[text]                                AS [Blocked Query],
+    COALESCE(t1.[text], t2.[text])          AS [Blocking Query],
+
+    -- Extract Job ID from program_name
+    CONVERT(
+        uniqueidentifier,
+        CONVERT(
+            varbinary(16),
+            SUBSTRING(
+                s_blocker.program_name,
+                CHARINDEX('0x', s_blocker.program_name),
+                34
+            ),
+            1
         )
-        ELSE NULL
-    END                                     AS [SQL Agent Job Name]
+    )                                       AS [Job ID],
+
+    sj.name                                 AS [Job Name],
+    SUSER_SNAME(sj.owner_sid)               AS [Job Owner]
+
+INTO #BlockingJobs
 
 FROM
-    sys.dm_os_waiting_tasks             b
+    sys.dm_os_waiting_tasks                 b
 
 INNER JOIN
-    sys.dm_exec_requests                r
+    sys.dm_exec_requests                    r
         ON  r.session_id = b.session_id
         AND r.session_id > 50
 
 INNER JOIN
-    sys.dm_exec_sessions                s
+    sys.dm_exec_sessions                    s
         ON  s.session_id = b.session_id
 
 LEFT JOIN
-    sys.dm_exec_requests                r1
+    sys.dm_exec_requests                    r1
         ON  r1.session_id = b.blocking_session_id
 
 LEFT JOIN
-    sys.dm_exec_sessions                s_blocker
+    sys.dm_exec_sessions                    s_blocker
         ON  s_blocker.session_id = b.blocking_session_id
 
 LEFT JOIN
-    sys.dm_exec_connections             c1
+    sys.dm_exec_connections                 c1
         ON  c1.session_id = b.blocking_session_id
 
-OUTER APPLY
-    sys.dm_exec_sql_text(r.sql_handle)              t
+INNER JOIN
+    msdb.dbo.sysjobs                        sj
+        ON  sj.job_id = CONVERT(
+                uniqueidentifier,
+                CONVERT(
+                    varbinary(16),
+                    SUBSTRING(
+                        s_blocker.program_name,
+                        CHARINDEX('0x', s_blocker.program_name),
+                        34
+                    ),
+                    1
+                )
+            )
 
-OUTER APPLY
-    sys.dm_exec_sql_text(r1.sql_handle)             t1
-
-OUTER APPLY
-    sys.dm_exec_sql_text(c1.most_recent_sql_handle) t2
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle)              t
+OUTER APPLY sys.dm_exec_sql_text(r1.sql_handle)             t1
+OUTER APPLY sys.dm_exec_sql_text(c1.most_recent_sql_handle) t2
 
 WHERE
     b.blocking_session_id <> 0
     AND b.blocking_session_id <> b.session_id
+    AND s_blocker.program_name LIKE 'SQLAgent - TSQL JobStep%';
 
-ORDER BY
-    (b.wait_duration_ms / 1000) / 60 DESC;
+
+-- ============================================================
+-- STEP 2: Log ALL detected blocking jobs (before any action)
+-- ============================================================
+INSERT INTO dbadb.dbo.BlockingJobLog (
+    LogDate,
+    ServerName,
+    BlockedSessionID,
+    BlockingSessionID,
+    JobName,
+    JobOwner,
+    JobID,
+    WaitingMinutes,
+    WaitType,
+    BlockingQuery,
+    BlockedQuery,
+    ActionTaken,
+    Remarks
+)
+SELECT
+    GETDATE(),
+    @@SERVERNAME,
+    [Blocked Session ID],
+    [Blocking Session ID],
+    [Job Name],
+    [Job Owner],
+    [Job ID],
+    [Waiting in Minutes],
+    [Wait Type],
+    [Blocking Query],
+    [Blocked Query],
+    'DETECTED ONLY',                            -- will be updated after action
+    CASE
+        WHEN [Job Owner] = 'dba_agent' 
+        THEN 'Owner matched dba_agent — queued for stop.'
+        ELSE 'Owner is [' + ISNULL([Job Owner],'unknown') + '] — no action taken.'
+    END
+FROM #BlockingJobs;
+
+
+-- ============================================================
+-- STEP 3: Stop each blocking job owned by dba_agent
+--         and update the log with result
+-- ============================================================
+DECLARE
+    @JobName        NVARCHAR(256),
+    @JobOwner       NVARCHAR(256),
+    @JobID          UNIQUEIDENTIFIER,
+    @WaitMinutes    INT,
+    @ActionTaken    NVARCHAR(100),
+    @Remarks        NVARCHAR(1000),
+    @LogID          INT;
+
+DECLARE job_cursor CURSOR FAST_FORWARD FOR
+    SELECT DISTINCT
+        [Job Name],
+        [Job Owner],
+        [Job ID],
+        [Waiting in Minutes]
+    FROM #BlockingJobs
+    WHERE [Job Owner] = 'dba_agent';
+
+OPEN job_cursor;
+FETCH NEXT FROM job_cursor INTO @JobName, @JobOwner, @JobID, @WaitMinutes;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+
+    -- Get the LogID just inserted for this job in Step 2
+    SELECT TOP 1 @LogID = LogID
+    FROM dbadb.dbo.BlockingJobLog
+    WHERE JobName   = @JobName
+      AND JobOwner  = @JobOwner
+      AND JobID     = @JobID
+      AND ActionTaken = 'DETECTED ONLY'
+    ORDER BY LogID DESC;
+
+    -- Safety check: confirm job is still actively running
+    IF EXISTS (
+        SELECT 1
+        FROM msdb.dbo.sysjobactivity ja
+        INNER JOIN msdb.dbo.sysjobs   sj ON sj.job_id = ja.job_id
+        WHERE sj.name                   = @JobName
+          AND ja.start_execution_date   IS NOT NULL
+          AND ja.stop_execution_date    IS NULL
+          AND ja.session_id = (
+                SELECT MAX(session_id) 
+                FROM msdb.dbo.syssessions
+              )
+    )
+    BEGIN
+        BEGIN TRY
+            -- ✅ Stop the job
+            EXEC msdb.dbo.sp_stop_job @job_name = @JobName;
+
+            SET @ActionTaken = 'JOB STOPPED';
+            SET @Remarks     = 'Job successfully stopped by blocking monitor at ' 
+                                + CONVERT(VARCHAR, GETDATE(), 120);
+
+            PRINT '[' + CONVERT(VARCHAR, GETDATE(), 120) + '] '
+                + 'STOPPED job [' + @JobName + '] '
+                + 'owned by [' + @JobOwner + '] '
+                + '— blocked for ' + CAST(@WaitMinutes AS VARCHAR) + ' minute(s).';
+        END TRY
+        BEGIN CATCH
+            SET @ActionTaken = 'STOP FAILED';
+            SET @Remarks     = 'ERROR ' + CAST(ERROR_NUMBER() AS VARCHAR)
+                                + ': ' + ERROR_MESSAGE();
+
+            PRINT '[' + CONVERT(VARCHAR, GETDATE(), 120) + '] '
+                + 'FAILED to stop job [' + @JobName + ']: ' + ERROR_MESSAGE();
+        END CATCH
+    END
+    ELSE
+    BEGIN
+        SET @ActionTaken = 'JOB NOT RUNNING';
+        SET @Remarks     = 'Job was no longer active when stop was attempted at '
+                            + CONVERT(VARCHAR, GETDATE(), 120);
+
+        PRINT 'Job [' + @JobName + '] is no longer running — skipped.';
+    END
+
+    -- ✅ Update the log row with the final action result
+    UPDATE dbadb.dbo.BlockingJobLog
+    SET
+        ActionTaken = @ActionTaken,
+        Remarks     = @Remarks
+    WHERE LogID = @LogID;
+
+    FETCH NEXT FROM job_cursor INTO @JobName, @JobOwner, @JobID, @WaitMinutes;
+END
+
+CLOSE job_cursor;
+DEALLOCATE job_cursor;
+DROP TABLE #BlockingJobs;
+
+
+-- ============================================================
+-- STEP 4: Review recent log entries
+-- ============================================================
+SELECT TOP 50
+    LogID,
+    LogDate,
+    ServerName,
+    BlockedSessionID,
+    BlockingSessionID,
+    JobName,
+    JobOwner,
+    WaitingMinutes,
+    WaitType,
+    ActionTaken,
+    Remarks,
+    BlockingQuery,
+    BlockedQuery
+FROM dbadb.dbo.BlockingJobLog
+ORDER BY LogID DESC;
+```
+
+---
+
+## Log Table — Column Reference
+
+| Column | Description |
+|--------|-------------|
+| `LogID` | Auto-increment primary key |
+| `LogDate` | Exact timestamp of detection |
+| `ServerName` | `@@SERVERNAME` — useful for central monitoring |
+| `BlockedSessionID` | Session being blocked |
+| `BlockingSessionID` | Session doing the blocking |
+| `JobName` | Resolved Agent job name |
+| `JobOwner` | Resolved login name of job owner |
+| `JobID` | GUID from `msdb.sysjobs` |
+| `WaitingMinutes` | How long the block had been running |
+| `WaitType` | e.g. `LCK_M_X`, `LCK_M_S` |
+| `BlockingQuery` | Last SQL run by the blocking job |
+| `BlockedQuery` | SQL waiting to execute |
+| `ActionTaken` | `DETECTED ONLY` / `JOB STOPPED` / `JOB NOT RUNNING` / `STOP FAILED` |
+| `Remarks` | Timestamped detail message for each outcome |
+
+---
+
+## ActionTaken Values Explained
+```
+DETECTED ONLY   → Job is owned by someone other than dba_agent, logged but untouched
+JOB STOPPED     → sp_stop_job executed successfully
+JOB NOT RUNNING → Job finished on its own before stop was attempted  
+STOP FAILED     → sp_stop_job threw an error (logged with error number + message)
