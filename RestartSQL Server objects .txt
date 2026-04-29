@@ -1,0 +1,204 @@
+
+
+
+USE [DBADB]
+GO
+
+/****** Object:  Table [dbo].[RestartEvidence]    Script Date: 4/14/2026 2:27:05 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[RestartEvidence](
+	[ServerName] [varchar](128) NULL,
+	[HostName] [varchar](128) NULL,
+	[RestartTime] [datetime] NULL,
+	[Uptime_Minutes] [int] NULL,
+	[ErrorEvidenceJSON] [nvarchar](max) NULL,
+	[CapturedTime] [datetime] NULL
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+
+/****** Object:  Table [dbo].[SQLServerRestartHistory]    Script Date: 4/14/2026 2:27:05 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[SQLServerRestartHistory](
+	[RestartID] [int] IDENTITY(1,1) NOT NULL,
+	[ServerName] [sysname] NOT NULL,
+	[SQLStartTime] [datetime] NOT NULL,
+	[PreviousShutdownTime] [datetime] NULL,
+	[Uptime_Minutes] [int] NULL,
+	[Downtime_Minutes] [int] NULL,
+	[EvidenceSummary] [nvarchar](max) NULL,
+	[RestartType] [varchar](50) NULL,
+	[ProcessingStatus] [varchar](20) NULL,
+	[CaptureTime] [datetime] NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[RestartID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, FILLFACTOR = 95) ON [PRIMARY],
+ CONSTRAINT [UQ_SQLStartTime] UNIQUE NONCLUSTERED 
+(
+	[SQLStartTime] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, FILLFACTOR = 95) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+
+/****** Object:  Table [geomon].[ServerRestartHistory]    Script Date: 4/14/2026 2:27:05 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [geomon].[ServerRestartHistory](
+	[server_name] [varchar](100) NULL,
+	[host_name] [varchar](100) NULL,
+	[restart_time] [datetime] NULL
+) ON [PRIMARY]
+GO
+
+ALTER TABLE [dbo].[SQLServerRestartHistory] ADD  DEFAULT (@@servername) FOR [ServerName]
+GO
+
+ALTER TABLE [dbo].[SQLServerRestartHistory] ADD  DEFAULT ('PENDING_AI_ANALYSIS') FOR [RestartType]
+GO
+
+ALTER TABLE [dbo].[SQLServerRestartHistory] ADD  DEFAULT ('PENDING_PUSH') FOR [ProcessingStatus]
+GO
+
+ALTER TABLE [dbo].[SQLServerRestartHistory] ADD  DEFAULT (getdate()) FOR [CaptureTime]
+GO
+
+USE [DBADB]
+GO
+
+/****** Object:  StoredProcedure [geomon].[ServerRestartAlert]    Script Date: 4/14/2026 2:28:33 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE   PROCEDURE [geomon].[ServerRestartAlert] 
+(
+    @LookBackSeconds INT = 300
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @RestartTime DATETIME;
+
+    SELECT @RestartTime = sqlserver_start_time
+    FROM sys.dm_os_sys_info;
+
+    -- Only proceed if restart is recent
+    IF @RestartTime > DATEADD(SECOND, -@LookBackSeconds, GETDATE())
+    BEGIN
+        -- Insert only if not already logged
+        IF NOT EXISTS (
+            SELECT 1
+            FROM [geomon].[ServerRestartHistory]
+            WHERE restart_time = @RestartTime
+        )
+        BEGIN
+            INSERT INTO [geomon].[ServerRestartHistory]
+                (server_name, host_name, restart_time)
+            VALUES
+                (@@SERVERNAME, HOST_NAME(), @RestartTime);
+        END;
+
+        SELECT 
+            @@SERVERNAME AS server_name,
+            GETDATE() AS observation_time,
+            'Restarted' AS agent_status,
+            @RestartTime AS restart_time;
+    END
+END
+GO
+
+USE [DBADB]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CaptureRestartDetails]    Script Date: 4/14/2026 2:29:48 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE   PROCEDURE [dbo].[sp_CaptureRestartDetails]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @LastStartTime DATETIME, @PrevShutdown DATETIME, @LogJSON NVARCHAR(MAX);
+
+    -- 1. Get current SQL Start Time [cite: 17]
+    SELECT @LastStartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
+
+    -- 2. Find the last recorded 'shutdown' message in the ErrorLog [cite: 3]
+    DECLARE @LogTable TABLE (LogDate DATETIME, ProcessInfo VARCHAR(50), Text NVARCHAR(MAX));
+    INSERT INTO @LogTable EXEC xp_readerrorlog 0, 1, N'SQL Server shutdown has been initiated';
+    SELECT TOP 1 @PrevShutdown = LogDate FROM @LogTable ORDER BY LogDate DESC;
+
+    -- 3. Gather 50 log entries for AI Evidence [cite: 114]
+    DECLARE @Evidence TABLE (LogDate DATETIME, ProcInfo VARCHAR(50), Text NVARCHAR(MAX));
+    INSERT INTO @Evidence EXEC xp_readerrorlog 0; 
+    
+    -- Format as JSON so Claude API can parse it easily [cite: 114]
+    SET @LogJSON = (SELECT TOP 50 Text FROM @Evidence ORDER BY LogDate ASC FOR JSON PATH);
+
+    -- 4. Insert data using minutes for uptime [cite: 10, 158]
+    IF NOT EXISTS (SELECT 1 FROM dbo.SQLServerRestartHistory WHERE SQLStartTime = @LastStartTime)
+    BEGIN
+        INSERT INTO dbo.SQLServerRestartHistory 
+            (ServerName, SQLStartTime, PreviousShutdownTime, Uptime_Minutes, Downtime_Minutes, EvidenceSummary, RestartType, ProcessingStatus)
+        VALUES (
+            @@SERVERNAME, 
+            @LastStartTime, 
+            @PrevShutdown, 
+            DATEDIFF(MINUTE, @PrevShutdown, @LastStartTime), -- Uptime in Minutes [cite: 158]
+            DATEDIFF(MINUTE, @PrevShutdown, @LastStartTime), -- Downtime in Minutes [cite: 10]
+            @LogJSON, 
+            'PENDING_AI_ANALYSIS', 
+            'PENDING_PUSH'
+        );
+    END
+END;
+GO
+
+
+
+USE [master]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_CaptureRestartDetails_Master]    Script Date: 4/14/2026 2:26:25 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE   PROCEDURE [dbo].[sp_CaptureRestartDetails_Master]
+AS
+BEGIN
+    -- This calls your existing logic in the DBADB database
+    EXEC DBADB.dbo.sp_CaptureRestartDetails;
+END;
+GO
+
+EXEC sp_procoption N'[dbo].[sp_CaptureRestartDetails_Master]', 'startup', '1'
+GO
