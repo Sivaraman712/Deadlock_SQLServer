@@ -50,19 +50,7 @@ PRIMARY KEY CLUSTERED
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
-/****** Object:  Table [geomon].[ServerRestartHistory]    Script Date: 4/14/2026 2:27:05 PM ******/
-SET ANSI_NULLS ON
-GO
 
-SET QUOTED_IDENTIFIER ON
-GO
-
-CREATE TABLE [geomon].[ServerRestartHistory](
-	[server_name] [varchar](100) NULL,
-	[host_name] [varchar](100) NULL,
-	[restart_time] [datetime] NULL
-) ON [PRIMARY]
-GO
 
 ALTER TABLE [dbo].[SQLServerRestartHistory] ADD  DEFAULT (@@servername) FOR [ServerName]
 GO
@@ -79,51 +67,6 @@ GO
 USE [DBADB]
 GO
 
-/****** Object:  StoredProcedure [geomon].[ServerRestartAlert]    Script Date: 4/14/2026 2:28:33 PM ******/
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
-
-
-CREATE   PROCEDURE [geomon].[ServerRestartAlert] 
-(
-    @LookBackSeconds INT = 300
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @RestartTime DATETIME;
-
-    SELECT @RestartTime = sqlserver_start_time
-    FROM sys.dm_os_sys_info;
-
-    -- Only proceed if restart is recent
-    IF @RestartTime > DATEADD(SECOND, -@LookBackSeconds, GETDATE())
-    BEGIN
-        -- Insert only if not already logged
-        IF NOT EXISTS (
-            SELECT 1
-            FROM [geomon].[ServerRestartHistory]
-            WHERE restart_time = @RestartTime
-        )
-        BEGIN
-            INSERT INTO [geomon].[ServerRestartHistory]
-                (server_name, host_name, restart_time)
-            VALUES
-                (@@SERVERNAME, HOST_NAME(), @RestartTime);
-        END;
-
-        SELECT 
-            @@SERVERNAME AS server_name,
-            GETDATE() AS observation_time,
-            'Restarted' AS agent_status,
-            @RestartTime AS restart_time;
-    END
-END
-GO
 
 USE [DBADB]
 GO
