@@ -1,0 +1,28 @@
+IF EXISTS
+(
+    SELECT 1
+    FROM msdb.dbo.sysjobactivity sja
+    INNER JOIN msdb.dbo.syssessions ss
+        ON sja.session_id = ss.session_id
+    WHERE ss.agent_start_date = (
+            SELECT MAX(agent_start_date)
+            FROM msdb.dbo.syssessions
+          )
+      AND sja.job_id = @JobID
+      AND sja.start_execution_date IS NOT NULL
+      AND sja.stop_execution_date IS NULL
+)
+BEGIN
+    EXEC msdb.dbo.sp_stop_job @job_id = @JobID;
+
+    SET @ActionTaken = 'JOB STOPPED';
+    SET @Remarks = 'Job successfully stopped';
+END
+ELSE
+BEGIN
+    SET @ActionTaken = 'JOB NOT RUNNING';
+    SET @Remarks = 'Stop skipped - job not running';
+
+    PRINT '[' + CONVERT(VARCHAR, GETDATE(), 120) + '] '
+        + 'SKIPPED job [' + @JobName + '] - Job not running';
+END
