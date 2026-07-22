@@ -1,0 +1,16 @@
+SELECT
+    s.session_id,
+    COALESCE(st.text, ib.event_info) AS blocker_query
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r
+    ON s.session_id = r.session_id
+LEFT JOIN sys.dm_exec_connections c
+    ON s.session_id = c.session_id
+OUTER APPLY sys.dm_exec_sql_text(
+    COALESCE(r.sql_handle, c.most_recent_sql_handle)
+) st
+OUTER APPLY sys.dm_exec_input_buffer(
+    s.session_id,
+    NULL
+) ib
+WHERE s.session_id = 195;
