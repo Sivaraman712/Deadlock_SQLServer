@@ -43,3 +43,10 @@ STRING_AGG(
     ''
 )
 FROM dbadb.dbo.longqrydetails
+
+
+UPDATE dbadb..longqrydetails
+SET StatementText = CAST(REPLACE(CAST(StatementText AS VARBINARY(MAX)), 0x0000, 0x) AS NVARCHAR(MAX)),
+    ExecutingSQL   = CAST(REPLACE(CAST(ExecutingSQL   AS VARBINARY(MAX)), 0x0000, 0x) AS NVARCHAR(MAX))
+WHERE CHARINDEX(NCHAR(0), StatementText) > 0
+   OR CHARINDEX(NCHAR(0), ExecutingSQL) > 0;
