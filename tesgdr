@@ -5,3 +5,12 @@ SELECT
     UNICODE(SUBSTRING(StatementText,LEN(StatementText)+1,1)) AS NextChar
 FROM dbadb..longqrydetails
 WHERE SPID = 192;
+
+GO
+
+SELECT
+    StatementText,
+    REPLACE(StatementText, NCHAR(0), '') AS CleanedText,
+    UNICODE(RIGHT(REPLACE(StatementText, NCHAR(0), ''), 1)) AS LastCharAfterReplace
+FROM dbadb.dbo.longqrydetails
+WHERE SPID = 192;
