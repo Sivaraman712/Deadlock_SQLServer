@@ -14,3 +14,13 @@ SELECT
     UNICODE(RIGHT(REPLACE(StatementText, NCHAR(0), ''), 1)) AS LastCharAfterReplace
 FROM dbadb.dbo.longqrydetails
 WHERE SPID = 192;
+
+
+CASE
+    WHEN CHARINDEX(NCHAR(0), StatementText) > 0
+    THEN LEFT(
+            StatementText,
+            CHARINDEX(NCHAR(0), StatementText) - 1
+         )
+    ELSE StatementText
+END
