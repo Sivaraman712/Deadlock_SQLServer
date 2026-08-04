@@ -1,0 +1,7 @@
+SELECT
+    StatementText,
+    LEN(StatementText) AS LenText,
+    DATALENGTH(StatementText) AS DataLen,
+    UNICODE(SUBSTRING(StatementText,LEN(StatementText)+1,1)) AS NextChar
+FROM dbadb..longqrydetails
+WHERE SPID = 192;
