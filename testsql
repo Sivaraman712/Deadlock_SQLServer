@@ -1,0 +1,16 @@
+SELECT
+STRING_AGG(
+    CAST(
+        '<tr>' +
+        '<td>' + ISNULL(CAST(SPID AS VARCHAR(20)), '') + '</td>' +
+        '<td>' + ISNULL(CONVERT(VARCHAR(19), StartTime, 120), '') + '</td>' +
+        '<td>' + ISNULL(ElapsedTime, '') + '</td>' +
+        '<td>' + ISNULL(REPLACE(UserName,CHAR(0),''), '') + '</td>' +
+        '<td>' + ISNULL(REPLACE(DatabaseName,CHAR(0),''), '') + '</td>' +
+        '<td>' + ISNULL(LEFT(REPLACE(StatementText,CHAR(0),''),250), '') + '</td>' +
+        '<td>' + ISNULL(REPLACE(WaitType,CHAR(0),''), '') + '</td>' +
+        '<td>' + ISNULL(REPLACE(StoredProcedure,CHAR(0),''), 'Query') + '</td>' +
+        '</tr>'
+    AS NVARCHAR(MAX)),
+    ''
+)
