@@ -24,3 +24,22 @@ CASE
          )
     ELSE StatementText
 END
+
+
+SELECT
+STRING_AGG(
+    CAST(
+        '<tr>' +
+        '<td>' + CAST(SPID AS varchar(20)) + '</td>' +
+        '<td>' + CONVERT(varchar(19),StartTime,120) + '</td>' +
+        '<td>' + ElapsedTime + '</td>' +
+        '<td>' + UserName + '</td>' +
+        '<td>' + DatabaseName + '</td>' +
+        '<td>' + LEFT(StatementText,250) + '</td>' +
+        '<td>' + WaitType + '</td>' +
+        '<td>' + ISNULL(StoredProcedure,'Query') + '</td>' +
+        '</tr>'
+    AS nvarchar(max)),
+    ''
+)
+FROM dbadb.dbo.longqrydetails
