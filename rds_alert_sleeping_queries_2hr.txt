@@ -1,0 +1,34 @@
+USE [msdb];
+GO
+
+-- 1. Create SQL Agent Job
+EXEC dbo.sp_add_job
+    @job_name = N'RDS_Alert_Sleeping_Queries_2HR',
+    @enabled = 1,
+    @description = N'Sends an HTML alert every 2 hours with total count if sleeping queries exist.';
+
+-- 2. Add Step to execute Procedure
+EXEC dbo.sp_add_jobstep
+    @job_name = N'RDS_Alert_Sleeping_Queries_2HR',
+    @step_name = N'Run Sleeping Query Check Procedure',
+    @subsystem = N'TSQL',
+    @command = N'EXEC dbo.usp_Alert_Sleeping_Sessions;',
+    @retry_attempts = 1,
+    @retry_interval = 5;
+
+-- 3. Set Schedule to Every 2 Hours
+EXEC dbo.sp_add_jobschedule
+    @job_name = N'RDS_Alert_Sleeping_Queries_2HR',
+    @name = N'Schedule_Every_2_Hours',
+    @enabled = 1,
+    @freq_type = 4,              -- Daily
+    @freq_interval = 1,          -- Every 1 day
+    @freq_subday_type = 8,       -- Unit: Hours
+    @freq_subday_interval = 2,   -- Runs Every 2 Hours
+    @active_start_time = 000000; -- Starts at 00:00:00 AM
+
+-- 4. Assign Job to Server
+EXEC dbo.sp_add_jobserver
+    @job_name = N'RDS_Alert_Sleeping_Queries_2HR',
+    @server_name = N'(LOCAL)';
+GO

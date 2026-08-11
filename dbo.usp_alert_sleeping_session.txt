@@ -1,0 +1,131 @@
+USE [msdb]; -- Change to your target DB if needed
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_Alert_Sleeping_Sessions
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @SleepingCount INT;
+    DECLARE @HTMLBody NVARCHAR(MAX);
+    DECLARE @TableRows NVARCHAR(MAX) = N'';
+    DECLARE @EmailSubject NVARCHAR(255);
+    
+    -- CONFIGURATION
+    DECLARE @DatabaseMailProfile NVARCHAR(100) ='Profile name'; -- Update Profile Name
+    DECLARE @RecipientsList VARCHAR(MAX) = 'mail id';-- Update Email Address
+
+    -- 1. Calculate Total Sleeping Sessions with Open Transactions across all user processes
+    SELECT @SleepingCount = COUNT(1)
+    FROM sys.dm_exec_sessions s
+    WHERE s.is_user_process = 1
+      AND s.status = 'sleeping'
+      AND s.open_transaction_count > 0; -- Open transactions requirement
+
+    -- 2. If sleeping sessions with open transactions exist, group by Login Name, Database Name, Host Name
+    IF @SleepingCount > 0
+    BEGIN
+        SET @EmailSubject = 'CRITICAL ALERT: ' + CAST(@SleepingCount AS VARCHAR(10)) + ' Sleeping Sessions with Open Transactions Detected on [' + @@SERVERNAME + ']';
+
+        -- Variables to hold grouped cursor data
+        DECLARE @login NVARCHAR(128), 
+                @dbname NVARCHAR(128), 
+                @hostname NVARCHAR(128), 
+                @grp_count INT,
+                @open_tran_count INT;
+
+        -- Cursor to fetch Grouped Data
+        DECLARE grouped_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT 
+            ISNULL(s.login_name, '-'),
+            ISNULL(DB_NAME(s.database_id), '-'),
+            ISNULL(s.host_name, '-'),
+            COUNT(1) AS session_count,
+            SUM(s.open_transaction_count) AS total_open_tran
+        FROM sys.dm_exec_sessions s
+        WHERE s.is_user_process = 1
+          AND s.status = 'sleeping'
+          AND s.open_transaction_count > 0
+        GROUP BY 
+            s.login_name,
+            s.database_id,
+            s.host_name
+        ORDER BY session_count DESC;
+
+        OPEN grouped_cursor;
+        FETCH NEXT FROM grouped_cursor INTO @login, @dbname, @hostname, @grp_count, @open_tran_count;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @TableRows = @TableRows + 
+                N'<tr>' +
+                N'<td style="border:1px solid #ddd; padding:8px;">' + @login + N'</td>' +
+                N'<td style="border:1px solid #ddd; padding:8px;">' + @dbname + N'</td>' +
+                N'<td style="border:1px solid #ddd; padding:8px;">' + @hostname + N'</td>' +
+                N'<td style="border:1px solid #ddd; padding:8px; text-align:center; font-weight:bold; color:#d9534f;">' + CAST(@grp_count AS VARCHAR(10)) + N'</td>' +
+                N'<td style="border:1px solid #ddd; padding:8px; text-align:center; font-weight:bold; color:#d9534f;">' + CAST(@open_tran_count AS VARCHAR(10)) + N'</td>' +
+                N'</tr>';
+
+            FETCH NEXT FROM grouped_cursor INTO @login, @dbname, @hostname, @grp_count, @open_tran_count;
+        END;
+
+        CLOSE grouped_cursor;
+        DEALLOCATE grouped_cursor;
+
+        -- Construct HTML Email Body
+        SET @HTMLBody = N'
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; color: #333; margin: 10px; }
+                .alert-header { background-color: #d9534f; color: white; padding: 14px; font-size: 18px; font-weight: bold; border-radius: 4px; text-align: center; }
+                .summary-box { background-color: #f2f4f8; border-left: 5px solid #d9534f; padding: 15px; margin: 15px 0; font-size: 14px; line-height: 1.6; }
+                .count-highlight { color: #d9534f; font-size: 20px; font-weight: bold; }
+                table { border-collapse: collapse; width: 100%; margin-top: 15px; font-size: 12px; }
+                th { background-color: #2c3e50; color: white; border: 1px solid #ddd; padding: 10px; text-align: left; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                .footer { margin-top: 20px; font-size: 11px; color: #777; text-align: center; }
+            </style>
+        </head>
+        <body>
+            <div class="alert-header">
+                RDS SQL Server Alert: Sleeping Sessions with Open Transactions
+            </div>
+            
+            <div class="summary-box">
+                <b>Server Name:</b> ' + @@SERVERNAME + N'<br/>
+                <b>Execution Time:</b> ' + CONVERT(VARCHAR, GETDATE(), 120) + N'<br/>
+                <b>Total Sleeping Sessions:</b> <span class="count-highlight">' + CAST(@SleepingCount AS VARCHAR(10)) + N'</span>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Login Name</th>
+                        <th>Database Name</th>
+                        <th>Host Name</th>
+                        <th style="text-align:center;">Sleeping Count</th>
+                        <th style="text-align:center;">Open Transactions Count</th>
+                    </tr>
+                </thead>
+                <tbody>' +
+                    @TableRows +
+                N'</tbody>
+            </table>
+            <div class="footer">
+                <p>This automated alert is scheduled to run every 2 hours via SQL Server Agent Job.</p>
+            </div>
+        </body>
+        </html>';
+
+        -- Send Email via Database Mail
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = @DatabaseMailProfile,
+            @recipients = @RecipientsList,
+            @subject = @EmailSubject,
+            @body = @HTMLBody,
+            @body_format = 'HTML';
+    END
+END;
+GO
