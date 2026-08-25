@@ -1,0 +1,63 @@
+USE AdventureWorks2025;
+GO
+
+CREATE TABLE dbo.TDE_SizeTest
+(
+    ID BIGINT IDENTITY(1,1),
+    RandomText CHAR(4000),
+    RandomDate DATETIME,
+    RandomNumber BIGINT
+);
+GO
+SET NOCOUNT ON;
+
+DECLARE @i INT = 1;
+
+WHILE @i <= 1000000
+BEGIN
+    INSERT INTO dbo.TDE_SizeTest
+    (
+        RandomText,
+        RandomDate,
+        RandomNumber
+    )
+    VALUES
+    (
+        REPLICATE(CHAR(65 + ABS(CHECKSUM(NEWID())) % 26), 4000),
+        DATEADD(DAY, ABS(CHECKSUM(NEWID())) % 3650, '2015-01-01'),
+        ABS(CHECKSUM(NEWID()))
+    );
+
+    SET @i += 1;
+END
+GO
+
+
+USE AdventureWorks2025;
+GO
+
+CREATE TABLE dbo.TDE_SizeTest
+(
+    ID BIGINT IDENTITY,
+    RandomData VARCHAR(MAX)
+);
+GO
+
+INSERT INTO dbo.TDE_SizeTest(RandomData)
+SELECT REPLICATE(CONVERT(VARCHAR(MAX), NEWID()), 100)
+FROM sys.all_objects a
+CROSS JOIN sys.all_objects b;
+GO
+
+INSERT INTO dbo.TDE_SizeTest(RandomData)
+SELECT RandomData
+FROM dbo.TDE_SizeTest;
+EXEC sp_spaceused;
+GO
+
+SELECT
+    DB_NAME() AS DatabaseName,
+    SUM(size) * 8.0 / 1024 AS SizeMB
+FROM sys.database_files
+GROUP BY DB_NAME();
+GO
